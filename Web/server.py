@@ -6,7 +6,7 @@ Login happens in the browser: login.html talks directly to Supabase.
 
 Run:
     python3 server.py
-Then open http://localhost:8000
+Then open http://localhost:8080
 """
 
 import importlib
@@ -17,10 +17,10 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "..", "Soduku"))
+sys.path.insert(0, os.path.join(HERE, "..", "sudokuMain"))
 generator = importlib.import_module("sudoku-generator")
 
-PORT = 8000
+PORT = 8080
 
 # The only files the browser may load: web address -> (file, content type).
 # Anything else (server.py, supabase.env, ...) gets a 404.
@@ -88,4 +88,4 @@ if __name__ == "__main__":
     # devices on your network (e.g. to test on your phone).
     # Threading: each browser connection gets its own thread, so one idle
     # connection (browsers open spare ones) can't block every other request.
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
