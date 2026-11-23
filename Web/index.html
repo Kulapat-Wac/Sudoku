@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sudoku</title>
+<style>
+  body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin: 20px; }
+  h1 { margin: 0 0 12px; }
+  .controls { margin-bottom: 12px; }
+  #account { margin-bottom: 12px; font-size: 14px; }
+  .controls select, .controls button { font-size: 16px; padding: 4px 10px; }
+  table { border-collapse: collapse; border: 3px solid #000; }
+  td { width: 40px; height: 40px; padding: 0; border: 1px solid #999; }
+  td:nth-child(3n) { border-right: 3px solid #000; }
+  tr:nth-child(3n) td { border-bottom: 3px solid #000; }
+  input { width: 100%; height: 100%; border: none; text-align: center; font-size: 22px; box-sizing: border-box; outline: none; }
+  input:focus { background: #e3f0ff; }
+  input.given { font-weight: bold; background: #f0f0f0; }
+  input.wrong { color: red; background: #ffe5e5; }
+  #message { margin-top: 12px; font-size: 18px; height: 24px; }
+</style>
+</head>
+<body>
+  <h1>Sudoku</h1>
+  <div class="controls">
+    <select id="difficulty">
+      <option value="easy">Easy</option>
+      <option value="medium" selected>Medium</option>
+      <option value="hard">Hard</option>
+      <option value="expert">Expert</option>
+    </select>
+    <button onclick="newGame()">New Game</button>
+    <button onclick="checkBoard()">Check</button>
+  </div>
+  <div id="account"><a href="/login">Log In</a></div>
+  <table id="board"></table>
+  <div id="message"></div>
+
+<script src="/vendor/supabase.js"></script>
+<script src="/supabase-config.js"></script>
+<script>
+  // Show who is logged in (Supabase keeps the session in the browser).
+  const db = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+  const account = document.getElementById("account");
+
+  db.auth.getSession().then(({ data }) => {
+    if (!data.session) return;
+    account.textContent = "Logged in as " + data.session.user.email + " · ";
+    const logout = document.createElement("a");
+    logout.href = "#";
+    logout.textContent = "Log out";
+    logout.onclick = async (e) => {
+      e.preventDefault();
+      await db.auth.signOut();
+      location.reload();
+    };
+    account.appendChild(logout);
+  });
+</script>
+<script>
+  let solution = [];
+  const board = document.getElementById("board");
+  const message = document.getElementById("message");
+
+  async function newGame() {
+    message.textContent = "Loading...";
+    const difficulty = document.getElementById("difficulty").value;
+    const data = await (await fetch("/api/puzzle?difficulty=" + difficulty)).json();
+    solution = data.solution;
+    board.innerHTML = "";
+    for (let r = 0; r < 9; r++) {
+      const tr = board.insertRow();
+      for (let c = 0; c < 9; c++) {
+        const input = document.createElement("input");
+        input.maxLength = 1;
+        input.inputMode = "numeric";
+        input.dataset.r = r;
+        input.dataset.c = c;
+        if (data.puzzle[r][c]) {
+          input.value = data.puzzle[r][c];
+          input.readOnly = true;
+          input.className = "given";
+        } else {
+          input.oninput = () => {
+            input.value = input.value.replace(/[^1-9]/g, "");
+            input.classList.remove("wrong");
+            message.textContent = "";
+          };
+        }
+        tr.insertCell().appendChild(input);
+      }
+    }
+    message.textContent = "";
+  }
+
+  function checkBoard() {
+    let empty = 0, wrong = 0;
+    for (const input of board.querySelectorAll("input:not(.given)")) {
+      const v = Number(input.value);
+      if (!v) { empty++; continue; }
+      const isWrong = v !== solution[input.dataset.r][input.dataset.c];
+      input.classList.toggle("wrong", isWrong);
+      if (isWrong) wrong++;
+    }
+    if (wrong) message.textContent = wrong + " mistake(s) shown in red.";
+    else if (empty) message.textContent = "No mistakes so far. " + empty + " cells left.";
+    else message.textContent = "🎉 Solved! Well done!";
+  }
+
+  newGame();
+</script>
+</body>
+</html>

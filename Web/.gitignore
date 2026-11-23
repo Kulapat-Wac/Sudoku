@@ -1,0 +1,7 @@
+supabase.env
+.env
+node_modules/
+__pycache__/
+supabase-setup.sql # stop it being added again by accident
+supabase-setup.sql # stop it being added again by accident
+supabase-setup.sql

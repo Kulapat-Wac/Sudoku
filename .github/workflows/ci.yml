@@ -1,0 +1,89 @@
+# Runs on every push and pull request: checks the puzzles and the website.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:   # lets you run it by hand from the Actions tab
+
+permissions:
+  contents: read       # the workflow only needs to read the code
+
+jobs:
+  puzzles:
+    name: Check Sudoku puzzles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate a puzzle
+        working-directory: Soduku
+        run: python sudoku-generator.py -d hard --seed 1
+
+      - name: Check 10 puzzles per difficulty
+        working-directory: Soduku
+        run: python sudoku-checker.py -n 10
+
+  website:
+    name: Check website
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install npm packages
+        working-directory: Web
+        run: npm ci
+
+      - name: Check npm packages for known vulnerabilities
+        working-directory: Web
+        run: npm audit --omit=dev
+
+      - name: Start the server
+        working-directory: Web
+        run: |
+          nohup python server.py > server.log 2>&1 &
+          for i in $(seq 1 20); do
+            curl -s -o /dev/null http://127.0.0.1:8000/ && exit 0
+            sleep 0.5
+          done
+          echo "Server did not start:"; cat server.log; exit 1
+
+      - name: Public pages load
+        run: |
+          for path in / /login /vendor/supabase.js /supabase-config.js "/api/puzzle?difficulty=easy"; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:8000$path")
+            echo "$code $path"
+            [ "$code" = "200" ] || exit 1
+          done
+
+      - name: Private files are hidden
+        run: |
+          for path in /server.py /supabase.env /package.json /node_modules/@supabase/supabase-js/package.json /../Soduku/sudoku-checker.py; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:8000$path")
+            echo "$code $path"
+            [ "$code" = "404" ] || exit 1
+          done
+
+      - name: Puzzle API returns a valid puzzle
+        run: |
+          curl -s "http://127.0.0.1:8000/api/puzzle?difficulty=medium" > puzzle.json
+          cd Soduku && python sudoku-checker.py ../puzzle.json
+
+      - name: Security headers are sent
+        run: |
+          headers=$(curl -s -D - -o /dev/null http://127.0.0.1:8000/login)
+          for h in Content-Security-Policy X-Frame-Options X-Content-Type-Options Referrer-Policy; do
+            echo "$headers" | grep -qi "^$h:" && echo "ok  $h" || { echo "missing $h"; exit 1; }
+          done

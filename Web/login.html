@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Log In - Sudoku</title>
+<style>
+  body { font-family: sans-serif; display: flex; justify-content: center; margin: 40px 16px; }
+  form { width: 100%; max-width: 300px; display: flex; flex-direction: column; gap: 10px; }
+  h1 { margin: 0 0 8px; text-align: center; }
+  label { font-size: 14px; }
+  input { font-size: 16px; padding: 8px; border: 1px solid #999; border-radius: 4px; }
+  button { font-size: 16px; padding: 10px; border: none; border-radius: 4px; background: #2a6edb; color: white; cursor: pointer; }
+  button:hover { background: #1f58b3; }
+  button:disabled { opacity: 0.6; cursor: default; }
+  button.secondary { background: white; color: #2a6edb; border: 1px solid #2a6edb; }
+  button.secondary:hover { background: #eef4ff; }
+  #message { text-align: center; min-height: 20px; }
+  .error { color: #b00; }
+  .success { color: #187a2f; }
+  .back { text-align: center; font-size: 14px; }
+</style>
+</head>
+<body>
+  <form id="login-form">
+    <h1>Log In</h1>
+    <label for="email">Email</label>
+    <input id="email" type="email" required autocomplete="email">
+    <label for="password">Password</label>
+    <input id="password" type="password" required minlength="6" autocomplete="current-password">
+    <button type="submit" id="login-btn">Log In</button>
+    <button type="button" id="signup-btn" class="secondary">Create account</button>
+    <div id="message"></div>
+    <div class="back"><a href="/">Back to Sudoku</a></div>
+  </form>
+
+<script src="/vendor/supabase.js"></script>
+<script src="/supabase-config.js"></script>
+<script>
+  const db = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+  const form = document.getElementById("login-form");
+  const email = document.getElementById("email");
+  const password = document.getElementById("password");
+  const message = document.getElementById("message");
+  const buttons = form.querySelectorAll("button");
+
+  function show(text, success = false) {
+    message.textContent = text;            // textContent: never runs as HTML
+    message.className = success ? "success" : "error";
+  }
+
+  async function run(action) {
+    if (!form.reportValidity()) return;     // browser checks email + min length
+    buttons.forEach(b => b.disabled = true);
+    show("Please wait...", true);
+
+    const credentials = { email: email.value.trim(), password: password.value };
+    const { data, error } = action === "signup"
+      ? await db.auth.signUp(credentials)
+      : await db.auth.signInWithPassword(credentials);
+
+    buttons.forEach(b => b.disabled = false);
+    if (error) return show(error.message);
+
+    if (data.session) {
+      window.location.href = "/";           // logged in - back to the game
+    } else {
+      show("Account created. Check your email to confirm it, then log in.", true);
+    }
+  }
+
+  form.addEventListener("submit", e => { e.preventDefault(); run("login"); });
+  document.getElementById("signup-btn").addEventListener("click", () => run("signup"));
+</script>
+</body>
+</html>
