@@ -4,10 +4,10 @@ name: Tests
 on:
   push:
   pull_request:
-  workflow_dispatch:   # lets you run it by hand from the Actions tab
+  workflow_dispatch:  # manual run
 
 permissions:
-  contents: read       # the workflow only needs to read the code
+  contents: read       # read only
 
 jobs:
   puzzles:
