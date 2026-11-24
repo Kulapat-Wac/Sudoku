@@ -1,0 +1,27 @@
+# Secrets and private setup files
+**/*.env
+**/.env
+Web/supabase-setup.sql
+
+# Installed packages (the Dockerfile installs its own)
+**/node_modules/
+.venv/
+
+# Python caches
+**/__pycache__/
+**/*.pyc
+
+# Git, CI and editor files
+.git/
+.github/
+.vscode/
+**/.DS_Store
+*.logxs
+puzzle.json
+
+# Tests and docs aren't needed to run the site
+sudokuMain/unitTesting.py
+sudokuMain/e2eTesting.py
+readme.md
+Dockerfile
+.dockerignore
