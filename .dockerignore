@@ -22,6 +22,7 @@ puzzle.json
 # Tests and docs aren't needed to run the site
 sudokuMain/unitTesting.py
 sudokuMain/e2eTesting.py
+sudokuMain/test_users.json
 readme.md
 Dockerfile
 .dockerignore
