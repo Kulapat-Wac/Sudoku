@@ -33,73 +33,100 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "Web"))
 import server  # noqa: E402  (Web/server.py - its Handler serves the real site)
 
-CLUE_TARGETS = {"easy": 40, "medium": 32, "hard": 27, "expert": 23}
+# Clues per difficulty, straight from the generator. A puzzle may have up to
+# 2 more if the generator couldn't remove more and keep one solution.
+CLUES = server.generator.DIFFICULTY_CLUES
+EXTRA_CLUES = 2
 
-# The fake Supabase knows exactly one account.
-TEST_EMAIL = "player@example.com"
-TEST_PASSWORD = "correct-password"
+# The accounts the fake Supabase knows, from test_users.json (fake, not real logins).
+# Most tests use the first one; test_every_test_user_can_log_in uses them all.
+with open(os.path.join(HERE, "test_users.json")) as f:
+    TEST_USERS = {user["email"]: user["password"] for user in json.load(f)}
+TEST_EMAIL, TEST_PASSWORD = next(iter(TEST_USERS.items()))
+
+SUPABASE_URL = re.compile(r"https://[^/]+\.supabase\.co/.*")
+WRONG = re.compile(r"\bwrong\b")   # the CSS class Check puts on a wrong cell
+
+# Bits of JavaScript run inside the page. They are written as functions
+# (() => ...), not bare expressions, because the site's CSP blocks eval().
+BOARD_LOADED = ("document.querySelectorAll('#board input').length === 81"
+                " && document.getElementById('message').textContent !== 'Loading...'")
+PUZZLE_KEY = ("[...document.querySelectorAll('#board input')]"
+              ".map(i => i.classList.contains('given') ? i.value : '0').join('')")
 
 
-# Fake Supabase Auth (answers the browser's requests instead of supabase.co)
+# ----- Fake Supabase: answers the browser's requests instead of supabase.co -----
 
-def _fake_jwt(email):
-    def part(data):
-        return base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
-    claims = {"sub": "user-1", "email": email, "role": "authenticated",
-              "aud": "authenticated", "exp": int(time.time()) + 3600}
-    return f"{part({'alg': 'HS256', 'typ': 'JWT'})}.{part(claims)}.fake-signature"
-
-
-def _fake_user(email):
-    return {"id": "user-1", "aud": "authenticated", "role": "authenticated", "email": email,
+def fake_user(email):
+    return {"id": f"user-{email}", "aud": "authenticated", "role": "authenticated", "email": email,
             "email_confirmed_at": "2026-01-01T00:00:00Z", "app_metadata": {"provider": "email"},
             "user_metadata": {}, "created_at": "2026-01-01T00:00:00Z"}
 
 
+def fake_session(email):
+    def encode(data):
+        return base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
+
+    expires_at = int(time.time()) + 3600
+    claims = {"sub": f"user-{email}", "email": email, "role": "authenticated",
+              "aud": "authenticated", "exp": expires_at}
+    token = f"{encode({'alg': 'HS256', 'typ': 'JWT'})}.{encode(claims)}.fake-signature"
+    return {"access_token": token, "token_type": "bearer", "expires_in": 3600,
+            "expires_at": expires_at, "refresh_token": "fake-refresh", "user": fake_user(email)}
+
+
+def error(code, error_code, msg):
+    return {"code": code, "error_code": error_code, "msg": msg}
+
+
 class FakeSupabase:
     def __init__(self):
-        self.requests = []   # every request the page sent to Supabase
+        self.calls = []      # (method, url, body) of every real request (not CORS preflights)
+        self.sessions = {}   # access token -> email of the user it was given to
 
     def handle(self, route):
         request = route.request
+        if request.method == "OPTIONS":            # CORS preflight: just allow it
+            return self.reply(route, 200, {})
+
         body = json.loads(request.post_data or "{}") if request.method == "POST" else {}
-        self.requests.append((request.method, request.url, body))
-        url = request.url
+        self.calls.append((request.method, request.url, body))
+        url, email = request.url, body.get("email")
 
-        if "/auth/v1/token" in url:
-            if body.get("email") == TEST_EMAIL and body.get("password") == TEST_PASSWORD:
-                return self._json(route, 200, {
-                    "access_token": _fake_jwt(TEST_EMAIL), "token_type": "bearer",
-                    "expires_in": 3600, "expires_at": int(time.time()) + 3600,
-                    "refresh_token": "fake-refresh", "user": _fake_user(TEST_EMAIL)})
-            return self._json(route, 400, {"code": 400, "error_code": "invalid_credentials",
-                                           "msg": "Invalid login credentials"})
+        if "/auth/v1/token" in url:                # log in
+            if email in TEST_USERS and body.get("password") == TEST_USERS[email]:
+                session = fake_session(email)
+                self.sessions[session["access_token"]] = email
+                return self.reply(route, 200, session)
+            return self.reply(route, 400, error(400, "invalid_credentials", "Invalid login credentials"))
 
-        if "/auth/v1/signup" in url:
-            if body.get("email") == TEST_EMAIL:
-                return self._json(route, 422, {"code": 422, "error_code": "user_already_exists",
-                                               "msg": "User already registered"})
+        if "/auth/v1/signup" in url:               # create account
+            if email in TEST_USERS:
+                return self.reply(route, 422, error(422, "user_already_exists", "User already registered"))
             # Email confirmation is on: a user comes back, but no session.
-            return self._json(route, 200, {**_fake_user(body.get("email")), "email_confirmed_at": None})
+            return self.reply(route, 200, {**fake_user(email), "email_confirmed_at": None})
 
         if "/auth/v1/logout" in url:
-            return route.fulfill(status=204, body="")
+            return self.reply(route, 204, None)
 
-        if "/auth/v1/user" in url:
-            return self._json(route, 200, _fake_user(TEST_EMAIL))
+        if "/auth/v1/user" in url:                 # "who is logged in?"
+            token = request.headers.get("authorization", "").removeprefix("Bearer ")
+            if token in self.sessions:
+                return self.reply(route, 200, fake_user(self.sessions[token]))
+            return self.reply(route, 401, error(401, "bad_jwt", "invalid JWT"))
 
-        return self._json(route, 404, {"msg": f"fake Supabase: unexpected {url}"})
+        return self.reply(route, 404, {"msg": f"fake Supabase: unexpected {url}"})
 
     @staticmethod
-    def _json(route, status, data):
-        route.fulfill(status=status, content_type="application/json", body=json.dumps(data),
-                      headers={"Access-Control-Allow-Origin": "*"})
+    def reply(route, status, data):
+        route.fulfill(status=status, content_type="application/json",
+                      body="" if data is None else json.dumps(data),
+                      headers={"Access-Control-Allow-Origin": "*",
+                               "Access-Control-Allow-Headers": "*",
+                               "Access-Control-Allow-Methods": "*"})
 
-    def auth_calls(self):
-        return [r for r in self.requests if r[0] != "OPTIONS"]
 
-
-# Shared setup: start the website on a free port and open a browser
+# ----- Shared setup: run the website on a free port and open a browser -----
 
 class QuietHandler(server.Handler):
     """The real site handler, without printing every request during tests."""
@@ -131,35 +158,40 @@ class SudokuE2E(unittest.TestCase):
         cls.httpd.shutdown()
 
     def setUp(self):
+        # A fresh browser context per test = no cookies or saved logins carry over.
         self.supabase = FakeSupabase()
         self.context = self.browser.new_context()
-        self.context.route(re.compile(r"https://[^/]+\.supabase\.co/.*"), self.supabase.handle)
+        self.context.route(SUPABASE_URL, self.supabase.handle)
         self.page = self.context.new_page()
         self.page.set_default_timeout(15000)
-        self.errors = []
-        self.page.on("pageerror", lambda error: self.errors.append(str(error)))
-        self.dialogs = []
-        self.page.on("dialog", self._on_dialog)
+
+        self.errors = []    # JavaScript errors on the page
+        self.dialogs = []   # alert()/confirm() messages (accepted automatically)
+        self.page.on("pageerror", lambda err: self.errors.append(str(err)))
+        self.page.on("dialog", self.accept_dialog)
 
     def tearDown(self):
         self.context.close()
         self.assertEqual(self.errors, [], "JavaScript errors on the page")
 
-    def _on_dialog(self, dialog):
+    def accept_dialog(self, dialog):
         self.dialogs.append(dialog.message)
         dialog.accept()
 
-    # ----- helpers -----
+    # ----- the game page -----
 
     def open_game(self):
         self.page.goto(self.base + "/")
         self.wait_for_board()
 
     def wait_for_board(self):
-        # Written as functions, not bare expressions: the site's CSP blocks eval().
-        self.page.wait_for_function(
-            "() => document.querySelectorAll('#board input').length === 81"
-            " && document.getElementById('message').textContent !== 'Loading...'")
+        self.page.wait_for_function(f"() => {BOARD_LOADED}")
+
+    def click(self, button):
+        self.page.get_by_role("button", name=button).click()
+
+    def message(self):
+        return self.page.locator("#message")
 
     def cells(self):
         return self.page.locator("#board input")
@@ -167,217 +199,46 @@ class SudokuE2E(unittest.TestCase):
     def cell(self, r, c):
         return self.page.locator(f'#board input[data-r="{r}"][data-c="{c}"]')
 
+    def wrong_cells(self):
+        return self.page.locator("#board input.wrong")
+
     def board_state(self):
         """List of {r, c, value, given} for all 81 cells, read from the page."""
-        return self.page.evaluate("""[...document.querySelectorAll('#board input')].map(i => (
+        return self.page.evaluate("""() => [...document.querySelectorAll('#board input')].map(i => (
             {r: +i.dataset.r, c: +i.dataset.c, value: i.value, given: i.classList.contains('given')}))""")
-
-    def solution(self):
-        return self.page.evaluate("() => solution")   # the page keeps it in a global variable
 
     def empty_cells(self):
         return [(s["r"], s["c"]) for s in self.board_state() if not s["given"]]
 
     def given_count(self):
-        return sum(1 for s in self.board_state() if s["given"])
+        return sum(s["given"] for s in self.board_state())
 
     def puzzle_key(self):
-        return "".join(s["value"] if s["given"] else "0" for s in self.board_state())
+        """The clues as an 81-character string ('0' = empty), to tell puzzles apart."""
+        return self.page.evaluate(f"() => {PUZZLE_KEY}")
 
-    def new_game(self, difficulty):
-        before = self.puzzle_key()
-        self.page.select_option("#difficulty", difficulty)
-        self.page.get_by_role("button", name="New Game").click()
-        self.page.wait_for_function(
-            "before => document.getElementById('message').textContent !== 'Loading...'"
-            " && [...document.querySelectorAll('#board input')].map(i =>"
-            " i.classList.contains('given') ? i.value : '0').join('') !== before", arg=before)
+    def solution(self):
+        return self.page.evaluate("() => solution")   # the page keeps it in a global variable
 
-    def message(self):
-        return self.page.locator("#message")
+    def right_digit(self, r, c):
+        return str(self.solution()[r][c])
 
     def wrong_digit(self, r, c):
-        right = self.solution()[r][c]
-        return str(right % 9 + 1)   # any digit that isn't the right one
+        return str(self.solution()[r][c] % 9 + 1)   # any digit that isn't the right one
 
-
-# 1. Grid & input rules
-
-class TestGridAndInput(SudokuE2E):
-
-    def test_board_has_81_cells(self):
-        self.open_game()
-        expect(self.cells()).to_have_count(81)
-
-    def test_clue_cells_are_gray_and_read_only(self):
-        self.open_game()
-        givens = self.page.locator("#board input.given")
-        self.assertGreater(givens.count(), 0)
-        for i in range(givens.count()):
-            expect(givens.nth(i)).to_have_attribute("readonly", "")
-        first = givens.first
-        self.assertEqual(first.evaluate("e => getComputedStyle(e).backgroundColor"), "rgb(240, 240, 240)")
-
-    def test_clue_cells_cannot_be_overwritten(self):
-        self.open_game()
-        clue = self.page.locator("#board input.given").first
-        original = clue.input_value()
-        clue.click()
-        self.page.keyboard.press("Backspace")
-        self.page.keyboard.type("9")
-        expect(clue).to_have_value(original)
-
-    def test_empty_cells_accept_digits_1_to_9(self):
-        self.open_game()
-        r, c = self.empty_cells()[0]
-        box = self.cell(r, c)
-        for digit in "123456789":
-            box.fill("")
-            box.press_sequentially(digit)
-            expect(box).to_have_value(digit)
-
-    def test_empty_cells_reject_zero_letters_and_symbols(self):
-        self.open_game()
-        r, c = self.empty_cells()[0]
-        box = self.cell(r, c)
-        for bad in ["0", "a", "Z", "#", "-", " ", ".", "é"]:
-            with self.subTest(key=bad):
-                box.fill("")
-                box.press_sequentially(bad)
-                expect(box).to_have_value("")
-
-    def test_empty_cell_holds_only_one_digit(self):
-        self.open_game()
-        r, c = self.empty_cells()[0]
-        box = self.cell(r, c)
-        box.press_sequentially("57")
-        expect(box).to_have_value("5")
-
-
-# 2. "Check" button logic
-
-class TestCheckButton(SudokuE2E):
-
-    def check(self):
-        self.page.get_by_role("button", name="Check").click()
-
-    def test_check_on_empty_board_does_not_crash(self):
-        self.open_game()
-        left = len(self.empty_cells())
-        self.check()
-        expect(self.message()).to_have_text(f"No mistakes so far. {left} cells left.")
-
-    def test_wrong_entry_is_flagged_red(self):
-        self.open_game()
-        r, c = self.empty_cells()[0]
-        self.cell(r, c).fill(self.wrong_digit(r, c))
-        self.check()
-        expect(self.cell(r, c)).to_have_class(re.compile(r"\bwrong\b"))
-        expect(self.message()).to_have_text("1 mistake(s) shown in red.")
-
-    def test_correct_entries_are_not_flagged(self):
-        self.open_game()
+    def fill_correctly(self, cells):
         solution = self.solution()
-        empties = self.empty_cells()
-        for r, c in empties[:5]:
+        for r, c in cells:
             self.cell(r, c).fill(str(solution[r][c]))
-        self.check()
-        expect(self.page.locator("#board input.wrong")).to_have_count(0)
-        expect(self.message()).to_have_text(f"No mistakes so far. {len(empties) - 5} cells left.")
 
-    def test_counts_several_mistakes(self):
-        self.open_game()
-        for r, c in self.empty_cells()[:3]:
-            self.cell(r, c).fill(self.wrong_digit(r, c))
-        self.check()
-        expect(self.page.locator("#board input.wrong")).to_have_count(3)
-        expect(self.message()).to_have_text("3 mistake(s) shown in red.")
+    def new_game(self, difficulty):
+        """Pick a difficulty, press New Game and wait until a different puzzle shows."""
+        before = self.puzzle_key()
+        self.page.select_option("#difficulty", difficulty)
+        self.click("New Game")
+        self.page.wait_for_function(f"before => {BOARD_LOADED} && {PUZZLE_KEY} !== before", arg=before)
 
-    def test_fixing_a_mistake_clears_the_red(self):
-        self.open_game()
-        r, c = self.empty_cells()[0]
-        box = self.cell(r, c)
-        box.fill(self.wrong_digit(r, c))
-        self.check()
-        expect(box).to_have_class(re.compile(r"\bwrong\b"))
-        box.fill("")
-        box.press_sequentially(str(self.solution()[r][c]))
-        expect(box).not_to_have_class(re.compile(r"\bwrong\b"))
-        self.check()
-        expect(self.page.locator("#board input.wrong")).to_have_count(0)
-
-    def test_full_correct_board_shows_win(self):
-        self.open_game()
-        solution = self.solution()
-        for r, c in self.empty_cells():
-            self.cell(r, c).fill(str(solution[r][c]))
-        self.check()
-        expect(self.message()).to_contain_text("Solved! Well done!")
-        expect(self.page.locator("#board input.wrong")).to_have_count(0)
-
-    def test_full_board_with_one_mistake_is_not_a_win(self):
-        self.open_game()
-        solution = self.solution()
-        empties = self.empty_cells()
-        for r, c in empties:
-            self.cell(r, c).fill(str(solution[r][c]))
-        r, c = empties[0]
-        self.cell(r, c).fill(self.wrong_digit(r, c))
-        self.check()
-        expect(self.message()).to_have_text("1 mistake(s) shown in red.")
-        expect(self.message()).not_to_contain_text("Solved")
-
-
-# 3. Difficulty & "New Game" flow
-
-class TestNewGame(SudokuE2E):
-
-    def test_default_difficulty_is_medium(self):
-        self.open_game()
-        expect(self.page.locator("#difficulty")).to_have_value("medium")
-        self.assertTrue(CLUE_TARGETS["medium"] <= self.given_count() <= CLUE_TARGETS["medium"] + 2)
-
-    def test_each_difficulty_has_the_right_number_of_clues(self):
-        self.open_game()
-        for difficulty, target in CLUE_TARGETS.items():
-            with self.subTest(difficulty=difficulty):
-                self.new_game(difficulty)
-                clues = self.given_count()
-                self.assertGreaterEqual(clues, target)
-                self.assertLessEqual(clues, target + 2)
-
-    def test_new_game_gives_a_fresh_board(self):
-        self.open_game()
-        first = self.puzzle_key()
-        self.new_game("medium")
-        self.assertNotEqual(self.puzzle_key(), first)
-
-    def test_new_game_clears_entries_and_marks(self):
-        self.open_game()
-        r, c = self.empty_cells()[0]
-        self.cell(r, c).fill(self.wrong_digit(r, c))
-        self.page.get_by_role("button", name="Check").click()
-        self.new_game("easy")
-        expect(self.page.locator("#board input.wrong")).to_have_count(0)
-        expect(self.message()).to_have_text("")
-        self.assertTrue(all(s["value"] == "" for s in self.board_state() if not s["given"]))
-
-    @unittest.expectedFailure
-    def test_warns_before_wiping_a_game_in_progress(self):
-        """KNOWN GAP: New Game replaces the board straight away without asking.
-        Remove @expectedFailure once the page asks before wiping entries."""
-        self.open_game()
-        r, c = self.empty_cells()[0]
-        self.cell(r, c).fill("5")
-        self.page.get_by_role("button", name="New Game").click()
-        self.page.wait_for_timeout(500)
-        warned = bool(self.dialogs) or self.page.get_by_text(re.compile("lose|progress|sure", re.I)).count() > 0
-        self.assertTrue(warned, "no warning before the game in progress was replaced")
-
-
-# 4. Authentication & session state
-
-class TestAuthentication(SudokuE2E):
+    # ----- the login page -----
 
     def open_login(self):
         self.page.goto(self.base + "/login")
@@ -387,8 +248,183 @@ class TestAuthentication(SudokuE2E):
         self.page.fill("#email", email)
         self.page.fill("#password", password)
 
-    def login_message(self):
-        return self.page.locator("#message")
+    def log_in(self, email=TEST_EMAIL, password=TEST_PASSWORD):
+        self.open_login()
+        self.fill_login(email, password)
+        self.click("Log In")
+        expect(self.page).to_have_url(self.base + "/")
+
+
+# 1. Grid & input rules
+
+class TestGridAndInput(SudokuE2E):
+
+    def setUp(self):
+        super().setUp()
+        self.open_game()
+        r, c = self.empty_cells()[0]
+        self.empty = self.cell(r, c)        # an empty cell to type into
+        self.clues = self.page.locator("#board input.given")
+
+    def test_board_has_81_cells(self):
+        expect(self.cells()).to_have_count(81)
+
+    def test_clue_cells_are_gray_and_read_only(self):
+        self.assertGreater(self.clues.count(), 0)
+        for clue in self.clues.all():
+            expect(clue).to_have_attribute("readonly", "")
+        background = self.clues.first.evaluate("e => getComputedStyle(e).backgroundColor")
+        self.assertEqual(background, "rgb(240, 240, 240)")
+
+    def test_clue_cells_cannot_be_overwritten(self):
+        clue = self.clues.first
+        original = clue.input_value()
+        clue.click()
+        self.page.keyboard.press("Backspace")
+        self.page.keyboard.type("9")
+        expect(clue).to_have_value(original)
+
+    def test_empty_cells_accept_digits_1_to_9(self):
+        for digit in "123456789":
+            self.empty.fill("")
+            self.empty.press_sequentially(digit)
+            expect(self.empty).to_have_value(digit)
+
+    def test_empty_cells_reject_zero_letters_and_symbols(self):
+        for key in ["0", "a", "Z", "#", "-", " ", ".", "é"]:
+            with self.subTest(key=key):
+                self.empty.fill("")
+                self.empty.press_sequentially(key)
+                expect(self.empty).to_have_value("")
+
+    def test_empty_cell_holds_only_one_digit(self):
+        self.empty.press_sequentially("57")
+        expect(self.empty).to_have_value("5")
+
+
+# 2. "Check" button logic
+
+class TestCheckButton(SudokuE2E):
+
+    def setUp(self):
+        super().setUp()
+        self.open_game()
+        self.empties = self.empty_cells()
+
+    def test_check_on_empty_board_does_not_crash(self):
+        self.click("Check")
+        expect(self.message()).to_have_text(f"No mistakes so far. {len(self.empties)} cells left.")
+
+    def test_wrong_entry_is_flagged_red(self):
+        r, c = self.empties[0]
+        self.cell(r, c).fill(self.wrong_digit(r, c))
+        self.click("Check")
+        expect(self.cell(r, c)).to_have_class(WRONG)
+        expect(self.message()).to_have_text("1 mistake(s) shown in red.")
+
+    def test_correct_entries_are_not_flagged(self):
+        self.fill_correctly(self.empties[:5])
+        self.click("Check")
+        expect(self.wrong_cells()).to_have_count(0)
+        expect(self.message()).to_have_text(f"No mistakes so far. {len(self.empties) - 5} cells left.")
+
+    def test_counts_several_mistakes(self):
+        for r, c in self.empties[:3]:
+            self.cell(r, c).fill(self.wrong_digit(r, c))
+        self.click("Check")
+        expect(self.wrong_cells()).to_have_count(3)
+        expect(self.message()).to_have_text("3 mistake(s) shown in red.")
+
+    def test_fixing_a_mistake_clears_the_red(self):
+        r, c = self.empties[0]
+        box = self.cell(r, c)
+        box.fill(self.wrong_digit(r, c))
+        self.click("Check")
+        expect(box).to_have_class(WRONG)
+
+        box.fill("")
+        box.press_sequentially(self.right_digit(r, c))
+        expect(box).not_to_have_class(WRONG)
+        self.click("Check")
+        expect(self.wrong_cells()).to_have_count(0)
+
+    def test_full_correct_board_shows_win(self):
+        self.fill_correctly(self.empties)
+        self.click("Check")
+        expect(self.message()).to_contain_text("Solved! Well done!")
+        expect(self.wrong_cells()).to_have_count(0)
+
+    def test_full_board_with_one_mistake_is_not_a_win(self):
+        self.fill_correctly(self.empties)
+        r, c = self.empties[0]
+        self.cell(r, c).fill(self.wrong_digit(r, c))
+        self.click("Check")
+        expect(self.message()).to_have_text("1 mistake(s) shown in red.")
+        expect(self.message()).not_to_contain_text("Solved")
+
+
+# 3. Difficulty & "New Game" flow
+
+class TestNewGame(SudokuE2E):
+
+    def setUp(self):
+        super().setUp()
+        self.open_game()
+
+    def assert_clue_count(self, difficulty):
+        self.assertTrue(CLUES[difficulty] <= self.given_count() <= CLUES[difficulty] + EXTRA_CLUES,
+                        f"{self.given_count()} clues on {difficulty}")
+
+    def test_default_difficulty_is_medium(self):
+        expect(self.page.locator("#difficulty")).to_have_value("medium")
+        self.assert_clue_count("medium")
+
+    def test_each_difficulty_has_the_right_number_of_clues(self):
+        for difficulty in CLUES:
+            with self.subTest(difficulty=difficulty):
+                self.new_game(difficulty)
+                self.assert_clue_count(difficulty)
+
+    def test_new_game_gives_a_fresh_board(self):
+        first = self.puzzle_key()
+        self.new_game("medium")
+        self.assertNotEqual(self.puzzle_key(), first)
+
+    def test_new_game_clears_entries_and_marks(self):
+        r, c = self.empty_cells()[0]
+        self.cell(r, c).fill(self.wrong_digit(r, c))
+        self.click("Check")
+        self.new_game("easy")
+        expect(self.wrong_cells()).to_have_count(0)
+        expect(self.message()).to_have_text("")
+        self.assertTrue(all(s["value"] == "" for s in self.board_state() if not s["given"]))
+
+    @unittest.expectedFailure
+    def test_warns_before_wiping_a_game_in_progress(self):
+        """KNOWN GAP: New Game replaces the board straight away without asking.
+        Remove @expectedFailure once the page asks before wiping entries."""
+        r, c = self.empty_cells()[0]
+        self.cell(r, c).fill("5")
+        self.click("New Game")
+        self.page.wait_for_timeout(500)
+        warning_on_page = self.page.get_by_text(re.compile("lose|progress|sure", re.I)).count() > 0
+        self.assertTrue(self.dialogs or warning_on_page,
+                        "no warning before the game in progress was replaced")
+
+
+# 4. Authentication & session state
+
+class TestAuthentication(SudokuE2E):
+
+    def assert_message(self, text, css_class):
+        expect(self.message()).to_have_text(text)
+        expect(self.message()).to_have_class(css_class)
+
+    def assert_logged_in(self, email=TEST_EMAIL):
+        expect(self.page.locator("#account")).to_contain_text(f"Logged in as {email}")
+
+    def assert_nothing_sent_to_supabase(self):
+        self.assertEqual(self.supabase.calls, [], "the form was sent to Supabase")
 
     def test_log_in_link_and_back_to_sudoku(self):
         self.open_game()
@@ -400,79 +436,93 @@ class TestAuthentication(SudokuE2E):
 
     def test_invalid_email_format_is_blocked(self):
         self.open_login()
-        for bad in ["not-an-email", "missing-at.com", "user@", "@example.com"]:
-            with self.subTest(email=bad):
-                self.fill_login(bad, TEST_PASSWORD)
-                self.page.get_by_role("button", name="Log In").click()
+        for email in ["not-an-email", "missing-at.com", "user@", "@example.com"]:
+            with self.subTest(email=email):
+                self.fill_login(email, TEST_PASSWORD)
+                self.click("Log In")
                 self.assertFalse(self.page.locator("#email").evaluate("e => e.checkValidity()"))
                 expect(self.page).to_have_url(self.base + "/login")
-        self.assertEqual(self.supabase.auth_calls(), [], "invalid email was sent to Supabase")
+        self.assert_nothing_sent_to_supabase()
 
     def test_empty_fields_are_blocked(self):
         self.open_login()
-        self.page.get_by_role("button", name="Log In").click()
-        self.page.get_by_role("button", name="Create account").click()
-        self.assertEqual(self.supabase.auth_calls(), [])
+        self.click("Log In")
+        self.click("Create account")
+        self.assert_nothing_sent_to_supabase()
 
     def test_short_password_is_blocked(self):
         self.open_login()
         self.fill_login(TEST_EMAIL, "12345")
-        self.page.get_by_role("button", name="Create account").click()
+        self.click("Create account")
         self.assertFalse(self.page.locator("#password").evaluate("e => e.checkValidity()"))
-        self.assertEqual(self.supabase.auth_calls(), [])
+        self.assert_nothing_sent_to_supabase()
 
     def test_wrong_password_shows_error(self):
         self.open_login()
         self.fill_login(TEST_EMAIL, "wrong-password")
-        self.page.get_by_role("button", name="Log In").click()
-        expect(self.login_message()).to_have_text("Invalid login credentials")
-        expect(self.login_message()).to_have_class("error")
+        self.click("Log In")
+        self.assert_message("Invalid login credentials", "error")
         expect(self.page).to_have_url(self.base + "/login")
         expect(self.page.get_by_role("button", name="Log In")).to_be_enabled()
 
     def test_correct_login_returns_to_game_logged_in(self):
-        self.open_login()
-        self.fill_login(TEST_EMAIL, TEST_PASSWORD)
-        self.page.get_by_role("button", name="Log In").click()
-        expect(self.page).to_have_url(self.base + "/")
-        expect(self.page.locator("#account")).to_contain_text(f"Logged in as {TEST_EMAIL}")
+        self.log_in()
+        self.assert_logged_in()
         self.wait_for_board()
 
+    def test_every_test_user_can_log_in(self):
+        self.assertEqual(len(TEST_USERS), 100)
+        for email, password in TEST_USERS.items():
+            with self.subTest(email=email):
+                self.log_in(email, password)
+                self.assert_logged_in(email)
+                self.page.evaluate("() => localStorage.clear()")   # forget them before the next user
+
+    def test_users_cannot_use_each_others_passwords(self):
+        first_email = list(TEST_USERS)[0]
+        second_password = list(TEST_USERS.values())[1]
+        self.open_login()
+        self.fill_login(first_email, second_password)
+        self.click("Log In")
+        self.assert_message("Invalid login credentials", "error")
+
     def test_log_out(self):
-        self.test_correct_login_returns_to_game_logged_in()
+        self.log_in()
+        self.assert_logged_in()
         self.page.get_by_role("link", name="Log out").click()
         expect(self.page.get_by_role("link", name="Log In")).to_be_visible()
         expect(self.page.locator("#account")).not_to_contain_text("Logged in")
 
     def test_login_survives_page_reload(self):
-        self.test_correct_login_returns_to_game_logged_in()
+        self.log_in()
+        self.assert_logged_in()
         self.page.reload()
-        expect(self.page.locator("#account")).to_contain_text(f"Logged in as {TEST_EMAIL}")
+        self.assert_logged_in()
 
     def test_create_account_asks_to_confirm_email(self):
         self.open_login()
-        self.fill_login("new.player@example.com", "new-password")
-        self.page.get_by_role("button", name="Create account").click()
-        expect(self.login_message()).to_have_text("Account created. Check your email to confirm it, then log in.")
-        expect(self.login_message()).to_have_class("success")
+        self.fill_login("new.user@example.com", "new-password")
+        self.click("Create account")
+        self.assert_message("Account created. Check your email to confirm it, then log in.", "success")
 
     def test_create_account_with_existing_email(self):
         self.open_login()
         self.fill_login(TEST_EMAIL, TEST_PASSWORD)
-        self.page.get_by_role("button", name="Create account").click()
-        expect(self.login_message()).to_have_text("User already registered")
-        expect(self.login_message()).to_have_class("error")
+        self.click("Create account")
+        self.assert_message("User already registered", "error")
 
     def test_password_is_sent_only_to_supabase(self):
-        self.open_login()
-        sent_to = []
-        self.page.on("request", lambda req: sent_to.append(req.url)
-                     if TEST_PASSWORD in (req.post_data or "") else None)
-        self.fill_login(TEST_EMAIL, TEST_PASSWORD)
-        self.page.get_by_role("button", name="Log In").click()
-        expect(self.page).to_have_url(self.base + "/")
-        self.assertTrue(sent_to)
-        self.assertTrue(all(re.match(r"https://[^/]+\.supabase\.co/auth/v1/token", u) for u in sent_to), sent_to)
+        sent_to = []   # every address the password was sent to
+
+        def watch(request):
+            if TEST_PASSWORD in (request.post_data or ""):
+                sent_to.append(request.url)
+
+        self.page.on("request", watch)
+        self.log_in()
+        self.assertTrue(sent_to, "the password was never sent")
+        for url in sent_to:
+            self.assertRegex(url, r"^https://[^/]+\.supabase\.co/auth/v1/token")
 
     @unittest.expectedFailure
     def test_board_is_kept_after_visiting_login(self):
