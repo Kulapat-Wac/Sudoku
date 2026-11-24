@@ -16,7 +16,7 @@ Web/supabase-setup.sql
 .github/
 .vscode/
 **/.DS_Store
-*.logxs
+*.log
 puzzle.json
 
 # Tests and docs aren't needed to run the site
