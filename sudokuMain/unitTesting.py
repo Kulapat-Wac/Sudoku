@@ -7,7 +7,7 @@ or simply:
     python3 unitTesting.py
 
 What is tested:
-  1. Arto Inkala's "world's hardest Sudoku" and known 17-clue puzzles (stress test)
+  1. Arto Inkala's "world's hardest Sudoku" and known 17-clue puzzles
   2. The generator makes valid boards with exactly one solution
   3. Row, column and 3x3 box conflicts are flagged correctly
   4. Difficulty labels compared with the solving techniques a puzzle really needs
@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import unittest
+from functools import lru_cache
 from itertools import combinations
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -26,13 +27,24 @@ checker = importlib.import_module("sudoku-checker")
 
 
 def board(text):
-    """Turn an 81-character string ('0' or '.' = empty) into a 9x9 list."""
-    text = text.replace(".", "0")
+    """Turn an 81-character string ('0' = empty) into a 9x9 list."""
     return [[int(text[r * 9 + c]) for c in range(9)] for r in range(9)]
 
 
 def copy(grid):
     return [row[:] for row in grid]
+
+
+def empty_grid():
+    return [[0] * 9 for _ in range(9)]
+
+
+def grid_with(number, *cells):
+    """An empty grid with `number` written in each of the given cells."""
+    grid = empty_grid()
+    for r, c in cells:
+        grid[r][c] = number
+    return grid
 
 
 # Arto Inkala's puzzle (2012), often called "the world's hardest Sudoku".
@@ -48,11 +60,15 @@ SEVENTEEN_CLUE = [
     board("000000012003600000000007000410020000000500300700000600280000040000300500000000000"),
 ]
 
-# A correct, complete grid used as a starting point for conflict tests.
-SOLVED = copy(INKALA_SOLUTION)
+DIFFICULTIES = list(generator.DIFFICULTY_CLUES)   # easy, medium, hard, expert
+SEEDS = range(10)                                 # fixed seeds = repeatable tests
+EVERY_CASE = [(d, s) for d in DIFFICULTIES for s in SEEDS]
 
-DIFFICULTIES = list(generator.DIFFICULTY_CLUES)  # easy, medium, hard, expert
-SEEDS = range(10)                                # fixed seeds = repeatable tests
+
+# Puzzles are slow to make (expert ~1 s), so make each one once and reuse it.
+@lru_cache(maxsize=None)
+def generated(difficulty, seed):
+    return generator.generate(difficulty, seed=seed)
 
 
 # Technique-based rater: solves the puzzle the way a person would and reports
@@ -67,17 +83,22 @@ ROWS = [[(r, c) for c in range(9)] for r in range(9)]
 COLS = [[(r, c) for r in range(9)] for c in range(9)]
 BOXES = [[(3 * (b // 3) + i, 3 * (b % 3) + j) for i in range(3) for j in range(3)] for b in range(9)]
 UNITS = ROWS + COLS + BOXES
-PEERS = {(r, c): {cell for unit in UNITS if (r, c) in unit for cell in unit} - {(r, c)}
-         for r in range(9) for c in range(9)}
+PEERS = {cell: {peer for unit in UNITS if cell in unit for peer in unit} - {cell}
+         for unit in ROWS for cell in unit}
 
 
 def rate_by_technique(puzzle):
     """Return the hardest technique needed: SINGLES, HIDDEN_SINGLES,
     INTERMEDIATE, or ADVANCED (cannot be solved with these techniques)."""
     grid = copy(puzzle)
-    empty = lambda cell: grid[cell[0]][cell[1]] == 0
-    options = {cell: ({grid[cell[0]][cell[1]]} if not empty(cell)
-                      else set(range(1, 10)) - {grid[r][c] for r, c in PEERS[cell]})
+
+    def empty(cell):
+        return grid[cell[0]][cell[1]] == 0
+
+    def value(cell):
+        return grid[cell[0]][cell[1]]
+
+    options = {cell: {value(cell)} if value(cell) else set(range(1, 10)) - {value(p) for p in PEERS[cell]}
                for cell in PEERS}
 
     def place(cell, number):
@@ -86,33 +107,31 @@ def rate_by_technique(puzzle):
         for peer in PEERS[cell]:
             options[peer].discard(number)
 
-    hardest = 0
-    while any(0 in row for row in grid):
-        # 1. Naked single: a cell with only one possible number.
-        cell = next((c for c in options if empty(c) and len(options[c]) == 1), None)
-        if cell:
-            place(cell, next(iter(options[cell])))
-            hardest = max(hardest, SINGLES)
-            continue
+    def remove(cells, numbers):
+        """Remove numbers from the options of cells; True if anything changed."""
+        changed = False
+        for cell in cells:
+            if options[cell] & numbers:
+                options[cell] -= numbers
+                changed = True
+        return changed
 
-        # 2. Hidden single: a number that fits in only one cell of a group.
-        placed = False
+    def naked_single():
+        # A cell with only one possible number.
+        for cell in options:
+            if empty(cell) and len(options[cell]) == 1:
+                return cell, next(iter(options[cell]))
+
+    def hidden_single():
+        # A number that fits in only one cell of a row, column or box.
         for unit in UNITS:
             for number in range(1, 10):
-                if any(grid[r][c] == number for r, c in unit):
-                    continue
-                spots = [c for c in unit if empty(c) and number in options[c]]
+                spots = [cell for cell in unit if empty(cell) and number in options[cell]]
                 if len(spots) == 1:
-                    place(spots[0], number)
-                    placed = True
-                    break
-            if placed:
-                break
-        if placed:
-            hardest = max(hardest, HIDDEN_SINGLES)
-            continue
+                    return spots[0], number
 
-        # 3. Intermediate: locked candidates and naked pairs remove options.
+    def intermediate():
+        # Locked candidates and naked pairs remove options.
         changed = False
         for box in BOXES:
             for line in ROWS + COLS:
@@ -123,37 +142,31 @@ def rate_by_technique(puzzle):
                     in_box = {c for c in box if empty(c) and number in options[c]}
                     in_line = {c for c in line if empty(c) and number in options[c]}
                     if in_box and in_box <= overlap:      # pointing
-                        for c in in_line - overlap:
-                            options[c].discard(number)
-                            changed = True
+                        changed |= remove(in_line - overlap, {number})
                     if in_line and in_line <= overlap:    # claiming
-                        for c in in_box - overlap:
-                            options[c].discard(number)
-                            changed = True
+                        changed |= remove(in_box - overlap, {number})
         for unit in UNITS:
             cells = [c for c in unit if empty(c)]
             for a, b in combinations(cells, 2):
                 if len(options[a]) == 2 and options[a] == options[b]:
-                    for c in cells:
-                        if c not in (a, b) and options[c] & options[a]:
-                            options[c] -= options[a]
-                            changed = True
-        if changed:
-            hardest = max(hardest, INTERMEDIATE)
-            continue
+                    others = [c for c in cells if c not in (a, b)]
+                    changed |= remove(others, set(options[a]))
+        return changed
 
-        return ADVANCED  # stuck: needs harder techniques or trial and error
+    hardest = 0
+    while any(0 in row for row in grid):
+        if move := naked_single():
+            place(*move)
+            level = SINGLES
+        elif move := hidden_single():
+            place(*move)
+            level = HIDDEN_SINGLES
+        elif intermediate():
+            level = INTERMEDIATE
+        else:
+            return ADVANCED   # stuck: needs harder techniques or trial and error
+        hardest = max(hardest, level)
     return hardest
-
-
-# Puzzles are slow to make (expert ~1 s), so make each one once and share it.
-_cache = {}
-
-
-def generated(difficulty, seed):
-    if (difficulty, seed) not in _cache:
-        _cache[(difficulty, seed)] = generator.generate(difficulty, seed=seed)
-    return _cache[(difficulty, seed)]
 
 
 # 1. Stress tests: Arto Inkala and 17-clue puzzles
@@ -194,10 +207,8 @@ class TestHardPuzzles(unittest.TestCase):
         for i, puzzle in enumerate(SEVENTEEN_CLUE):
             with self.subTest(puzzle=i):
                 solution = checker.find_solutions(puzzle, limit=1)[0]
-                for r in range(9):
-                    for c in range(9):
-                        if puzzle[r][c]:
-                            self.assertEqual(solution[r][c], puzzle[r][c])
+                self.assertTrue(all(solution[r][c] == puzzle[r][c]
+                                    for r in range(9) for c in range(9) if puzzle[r][c]))
 
     def test_sixteen_clues_is_not_unique(self):
         # Removing any clue from a 17-clue puzzle must give more than one solution.
@@ -206,11 +217,10 @@ class TestHardPuzzles(unittest.TestCase):
         puzzle[r][c] = 0
         self.assertEqual(generator.count_solutions(copy(puzzle)), 2)
         self.assertIn("only 16 clues (need at least 17)",
-                      checker.check_generated({"puzzle": puzzle, "solution": SOLVED}))
+                      checker.check_generated({"puzzle": puzzle, "solution": INKALA_SOLUTION}))
 
     def test_empty_board_is_not_unique(self):
-        empty = [[0] * 9 for _ in range(9)]
-        self.assertEqual(generator.count_solutions(copy(empty)), 2)
+        self.assertEqual(generator.count_solutions(empty_grid()), 2)
 
 
 # 2. Generator makes valid boards with a single solution
@@ -218,38 +228,32 @@ class TestHardPuzzles(unittest.TestCase):
 class TestGenerator(unittest.TestCase):
 
     def test_puzzles_have_exactly_one_solution(self):
-        for difficulty in DIFFICULTIES:
-            for seed in SEEDS:
-                with self.subTest(difficulty=difficulty, seed=seed):
-                    data = generated(difficulty, seed)
-                    self.assertEqual(len(checker.find_solutions(data["puzzle"], limit=2)), 1)
+        for difficulty, seed in EVERY_CASE:
+            with self.subTest(difficulty=difficulty, seed=seed):
+                puzzle = generated(difficulty, seed)["puzzle"]
+                self.assertEqual(len(checker.find_solutions(puzzle, limit=2)), 1)
 
     def test_solution_is_a_valid_complete_board(self):
-        for difficulty in DIFFICULTIES:
-            for seed in SEEDS:
-                with self.subTest(difficulty=difficulty, seed=seed):
-                    self.assertTrue(checker.is_solved(generated(difficulty, seed)["solution"]))
+        for difficulty, seed in EVERY_CASE:
+            with self.subTest(difficulty=difficulty, seed=seed):
+                self.assertTrue(checker.is_solved(generated(difficulty, seed)["solution"]))
 
     def test_unique_solution_is_the_returned_one(self):
-        for difficulty in DIFFICULTIES:
-            for seed in SEEDS:
-                with self.subTest(difficulty=difficulty, seed=seed):
-                    data = generated(difficulty, seed)
-                    self.assertEqual(checker.find_solutions(data["puzzle"], limit=1)[0], data["solution"])
+        for difficulty, seed in EVERY_CASE:
+            with self.subTest(difficulty=difficulty, seed=seed):
+                data = generated(difficulty, seed)
+                self.assertEqual(checker.find_solutions(data["puzzle"], limit=1)[0], data["solution"])
 
     def test_passes_full_checker(self):
-        for difficulty in DIFFICULTIES:
-            for seed in SEEDS:
-                with self.subTest(difficulty=difficulty, seed=seed):
-                    self.assertEqual(checker.check_generated(generated(difficulty, seed)), [])
+        for difficulty, seed in EVERY_CASE:
+            with self.subTest(difficulty=difficulty, seed=seed):
+                self.assertEqual(checker.check_generated(generated(difficulty, seed)), [])
 
     def test_clue_count_close_to_target(self):
-        for difficulty, target in generator.DIFFICULTY_CLUES.items():
-            for seed in SEEDS:
-                with self.subTest(difficulty=difficulty, seed=seed):
-                    clues = generated(difficulty, seed)["clues"]
-                    self.assertGreaterEqual(clues, target)
-                    self.assertLessEqual(clues, target + 2)
+        for difficulty, seed in EVERY_CASE:
+            with self.subTest(difficulty=difficulty, seed=seed):
+                target = generator.DIFFICULTY_CLUES[difficulty]
+                self.assertIn(generated(difficulty, seed)["clues"], range(target, target + 3))
 
     def test_same_seed_gives_same_puzzle(self):
         self.assertEqual(generator.generate("medium", seed=7), generator.generate("medium", seed=7))
@@ -261,7 +265,7 @@ class TestGenerator(unittest.TestCase):
         for seed in SEEDS:
             with self.subTest(seed=seed):
                 generator.random.seed(seed)
-                grid = [[0] * 9 for _ in range(9)]
+                grid = empty_grid()
                 self.assertTrue(generator.fill_board(grid))
                 self.assertTrue(checker.is_solved(grid))
 
@@ -275,51 +279,45 @@ class TestGenerator(unittest.TestCase):
 class TestConflicts(unittest.TestCase):
 
     def test_solved_board_has_no_conflicts(self):
-        self.assertEqual(checker.find_conflicts(SOLVED), [])
-        self.assertTrue(checker.is_solved(SOLVED))
+        self.assertEqual(checker.find_conflicts(INKALA_SOLUTION), [])
+        self.assertTrue(checker.is_solved(INKALA_SOLUTION))
 
     def test_row_conflict(self):
-        grid = [[0] * 9 for _ in range(9)]
-        grid[4][0] = grid[4][8] = 5            # same row, different columns and boxes
-        self.assertEqual(checker.find_conflicts(grid), [(4, 0), (4, 8)])
+        cells = [(4, 0), (4, 8)]            # same row, different columns and boxes
+        self.assertEqual(checker.find_conflicts(grid_with(5, *cells)), cells)
 
     def test_column_conflict(self):
-        grid = [[0] * 9 for _ in range(9)]
-        grid[0][6] = grid[8][6] = 3            # same column, different rows and boxes
-        self.assertEqual(checker.find_conflicts(grid), [(0, 6), (8, 6)])
+        cells = [(0, 6), (8, 6)]            # same column, different rows and boxes
+        self.assertEqual(checker.find_conflicts(grid_with(3, *cells)), cells)
 
     def test_box_conflict(self):
-        grid = [[0] * 9 for _ in range(9)]
-        grid[3][3] = grid[5][5] = 9            # same box, different row and column
-        self.assertEqual(checker.find_conflicts(grid), [(3, 3), (5, 5)])
+        cells = [(3, 3), (5, 5)]            # same box, different row and column
+        self.assertEqual(checker.find_conflicts(grid_with(9, *cells)), cells)
 
     def test_no_conflict_for_different_groups(self):
-        grid = [[0] * 9 for _ in range(9)]
-        grid[0][0] = grid[4][4] = 7            # different row, column and box
+        grid = grid_with(7, (0, 0), (4, 4))  # different row, column and box
         self.assertEqual(checker.find_conflicts(grid), [])
 
     def test_triple_conflict_flags_all_three(self):
-        grid = [[0] * 9 for _ in range(9)]
-        grid[0][0] = grid[0][5] = grid[7][0] = 2   # row clash and column clash share (0, 0)
-        self.assertEqual(checker.find_conflicts(grid), [(0, 0), (0, 5), (7, 0)])
+        cells = [(0, 0), (0, 5), (7, 0)]    # row clash and column clash share (0, 0)
+        self.assertEqual(checker.find_conflicts(grid_with(2, *cells)), cells)
 
     def test_box_only_errors_are_caught(self):
         # Every row and column holds 1-9, but the 3x3 boxes repeat numbers.
         grid = [[(r + c) % 9 + 1 for c in range(9)] for r in range(9)]
-        for i in range(9):
-            self.assertEqual(sorted(grid[i]), list(range(1, 10)))
-            self.assertEqual(sorted(grid[r][i] for r in range(9)), list(range(1, 10)))
+        for line in grid + [list(col) for col in zip(*grid)]:
+            self.assertEqual(sorted(line), list(range(1, 10)))
         self.assertFalse(checker.is_solved(grid))
         self.assertTrue(checker.find_conflicts(grid))
 
     def test_swapped_cells_break_the_solution(self):
-        grid = copy(SOLVED)
+        grid = copy(INKALA_SOLUTION)
         grid[0][0], grid[0][1] = grid[0][1], grid[0][0]   # row still fine, columns break
         self.assertFalse(checker.is_solved(grid))
         self.assertIn((0, 0), checker.find_conflicts(grid))
 
     def test_generator_candidates_skip_row_column_and_box(self):
-        grid = [[0] * 9 for _ in range(9)]
+        grid = empty_grid()
         grid[0][8] = 1      # same row as (0, 0)
         grid[8][0] = 2      # same column
         grid[2][2] = 3      # same box
@@ -335,28 +333,31 @@ class TestConflicts(unittest.TestCase):
                       checker.check_generated({"puzzle": puzzle, "solution": INKALA_SOLUTION}))
 
     def test_player_board_statuses(self):
-        puzzle = INKALA
-        self.assertEqual(checker.check_player_board(puzzle, copy(puzzle))["status"], "in_progress")
-        self.assertEqual(checker.check_player_board(puzzle, INKALA_SOLUTION)["status"], "solved")
+        def status(board):
+            return checker.check_player_board(INKALA, board)
 
-        clash = copy(puzzle)
+        self.assertEqual(status(copy(INKALA))["status"], "in_progress")
+        self.assertEqual(status(INKALA_SOLUTION)["status"], "solved")
+
+        clash = copy(INKALA)
         clash[0][1] = 8     # player types a second 8 in the first row
-        result = checker.check_player_board(puzzle, clash)
-        self.assertEqual(result["status"], "in_progress")
-        self.assertEqual(result["conflicts"], [(0, 0), (0, 1)])
+        self.assertEqual(status(clash), {"status": "in_progress", "conflicts": [(0, 0), (0, 1)]})
 
         changed_clue = copy(INKALA_SOLUTION)
         changed_clue[0][0] = 1  # overwrites the given 8
-        self.assertEqual(checker.check_player_board(puzzle, changed_clue)["status"], "invalid")
+        self.assertEqual(status(changed_clue)["status"], "invalid")
 
 
 # 4. Difficulty labels vs. the solving techniques really needed
 
 class TestDifficulty(unittest.TestCase):
 
+    def rating(self, difficulty, seed):
+        return rate_by_technique(generated(difficulty, seed)["puzzle"])
+
     def test_rater_on_reference_puzzles(self):
         # A board with one empty cell needs only a naked single.
-        one_gap = copy(SOLVED)
+        one_gap = copy(INKALA_SOLUTION)
         one_gap[4][4] = 0
         self.assertEqual(rate_by_technique(one_gap), SINGLES)
         self.assertEqual(rate_by_technique(INKALA), ADVANCED)
@@ -368,19 +369,16 @@ class TestDifficulty(unittest.TestCase):
     def test_easy_needs_only_naked_singles(self):
         for seed in SEEDS:
             with self.subTest(seed=seed):
-                self.assertEqual(rate_by_technique(generated("easy", seed)["puzzle"]), SINGLES)
+                self.assertEqual(self.rating("easy", seed), SINGLES)
 
     def test_harder_labels_need_harder_techniques_on_average(self):
-        averages = []
-        for difficulty in DIFFICULTIES:
-            ratings = [rate_by_technique(generated(difficulty, s)["puzzle"]) for s in SEEDS]
-            averages.append(sum(ratings) / len(ratings))
+        averages = [sum(self.rating(d, s) for s in SEEDS) / len(SEEDS) for d in DIFFICULTIES]
         self.assertEqual(averages, sorted(averages), f"average technique level per label: {averages}")
 
     def test_expert_is_never_singles_only(self):
         for seed in SEEDS:
             with self.subTest(seed=seed):
-                self.assertGreater(rate_by_technique(generated("expert", seed)["puzzle"]), SINGLES)
+                self.assertGreater(self.rating("expert", seed), SINGLES)
 
     @unittest.expectedFailure
     def test_every_puzzle_matches_its_label(self):
@@ -394,12 +392,8 @@ class TestDifficulty(unittest.TestCase):
             "hard":   {HIDDEN_SINGLES, INTERMEDIATE},
             "expert": {INTERMEDIATE, ADVANCED},
         }
-        mismatches = []
-        for difficulty in DIFFICULTIES:
-            for seed in SEEDS:
-                level = rate_by_technique(generated(difficulty, seed)["puzzle"])
-                if level not in allowed[difficulty]:
-                    mismatches.append(f"{difficulty} seed {seed}: needs {TECHNIQUE_NAMES[level]}")
+        mismatches = [f"{d} seed {s}: needs {TECHNIQUE_NAMES[self.rating(d, s)]}"
+                      for d, s in EVERY_CASE if self.rating(d, s) not in allowed[d]]
         self.assertEqual(mismatches, [], "\n" + "\n".join(mismatches))
 
 
