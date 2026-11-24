@@ -94,6 +94,9 @@ class Handler(BaseHTTPRequestHandler):
         #    (stops "clickjacking" tricks on the login page).
         #  - nosniff: the browser must trust our Content-Type.
         #  - Referrer-Policy: don't leak full URLs to other sites.
+        #  - HSTS: once a browser has seen this over HTTPS, it uses HTTPS for this
+        #    site for a year, even if someone types http://. Browsers ignore it on
+        #    plain HTTP, so it has no effect on http://localhost.
         self.send_header("Content-Security-Policy",
                          "default-src 'self'; script-src 'self' 'unsafe-inline'; "
                          "style-src 'self' 'unsafe-inline'; "
@@ -102,6 +105,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+        self.send_header("Strict-Transport-Security", "max-age=31536000")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

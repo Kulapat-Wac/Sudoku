@@ -150,6 +150,7 @@ class SudokuE2E(unittest.TestCase):
         threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
         cls.pw = sync_playwright().start()
         cls.browser = cls.pw.chromium.launch(headless=not os.environ.get("HEADED"))
+        expect.set_options(timeout=15000)   # same as the page timeout (expect's default is 5 s)
 
     @classmethod
     def tearDownClass(cls):
