@@ -1,17 +1,35 @@
-# Runs on every push and pull request: unit tests, website checks and E2E browser tests.
+# Runs on every push and pull request, and once a day: lint, unit tests, website checks and E2E browser tests, then builds and tests the Docker image (buildDocker.yml).
 name: Tests
 
 on:
   push:
   pull_request:
   workflow_dispatch:  # manual run
-
+  schedule:
+    - cron: "30 23 * * *" #23:30 UTC.
 permissions:
   contents: read       # read only
 
 jobs:
+  lint:
+    name: Lint Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ruff
+        run: python -m pip install ruff==0.17.6
+
+      - name: Run ruff
+        run: ruff check .
+
   puzzles:
     name: Check Sudoku puzzles
+    needs: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +52,7 @@ jobs:
 
   website:
     name: Check website
+    needs: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -94,6 +113,7 @@ jobs:
 
   e2e:
     name: E2E browser tests
+    needs: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -117,3 +137,8 @@ jobs:
 
       - name: Run E2E tests
         run: python sudokuMain/e2eTesting.py
+
+  docker:
+    name: Docker image
+    needs: [puzzles, website, e2e]   # only build once every test has passed
+    uses: ./.github/workflows/buildDocker.yml

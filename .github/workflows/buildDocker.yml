@@ -1,0 +1,79 @@
+# Builds the Docker image (the same way Render does) and tests the running container.
+# test.yml calls this once lint, puzzles, website and E2E tests have all passed.
+# It can also be started by hand from the Actions tab.
+name: Build Docker image
+
+on:
+  workflow_call:      # called from test.yml
+  workflow_dispatch:  # manual run
+
+permissions:
+  contents: read       # read only
+
+jobs:
+  docker:
+    name: Build and test Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"   # same as the Dockerfile; used to check the puzzle below
+
+      - name: Build the image (same as Render does)
+        run: docker build -t sudoku .
+
+      - name: Secrets and test files are not in the image
+        run: |
+          files=$(docker run --rm sudoku find /app -name "*.env" -o -name "supabase-setup.sql" \
+                  -o -name "e2eTesting.py" -o -name "unitTesting.py" -o -name "test_users.json")
+          [ -z "$files" ] || { echo "Should not be in the image:"; echo "$files"; exit 1; }
+          echo "ok  no secrets or test files"
+
+      - name: Runs as a non-root user
+        run: |
+          user=$(docker run --rm sudoku whoami)
+          echo "user: $user"
+          [ "$user" = "nobody" ] || exit 1
+
+      - name: Start the container
+        run: |
+          docker run -d --name sudoku -p 8080:8080 sudoku
+          for i in $(seq 1 20); do
+            curl -s -o /dev/null http://127.0.0.1:8080/ && exit 0
+            sleep 0.5
+          done
+          echo "Container did not start:"; docker logs sudoku; exit 1
+
+      - name: Public pages load (including the Supabase library copied from the npm stage)
+        run: |
+          for path in / /login /vendor/supabase.js /supabase-config.js "/api/puzzle?difficulty=easy"; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:8080$path")
+            echo "$code $path"
+            [ "$code" = "200" ] || exit 1
+          done
+
+      - name: Private files are hidden
+        run: |
+          for path in /server.py /package.json /Dockerfile /../sudokuMain/sudoku-checker.py; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:8080$path")
+            echo "$code $path"
+            [ "$code" = "404" ] || exit 1
+          done
+
+      - name: Puzzle API returns a valid puzzle
+        run: |
+          curl -s "http://127.0.0.1:8080/api/puzzle?difficulty=expert" > puzzle.json
+          cd sudokuMain && python sudoku-checker.py ../puzzle.json
+
+      - name: Security headers are sent
+        run: |
+          headers=$(curl -s -D - -o /dev/null http://127.0.0.1:8080/login)
+          for h in Content-Security-Policy X-Frame-Options X-Content-Type-Options Referrer-Policy Strict-Transport-Security; do
+            echo "$headers" | grep -qi "^$h:" && echo "ok  $h" || { echo "missing $h"; exit 1; }
+          done
+
+      - name: Show container logs if something failed
+        if: failure()
+        run: docker logs sudoku || true
