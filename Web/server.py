@@ -1,18 +1,16 @@
 """
-Simplest Sudoku website server (no installs needed - Python standard library only).
+Simplest Sudoku website server
 
 The server only hands out the web pages and new puzzles.
 Login happens in the browser: login.html talks directly to Supabase.
-
-Run:
-    python3 server.py
-Then open http://localhost:8080
 """
 
 import importlib
 import json
 import os
+import queue
 import sys
+import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -21,6 +19,33 @@ sys.path.insert(0, os.path.join(HERE, "..", "sudokuMain"))
 generator = importlib.import_module("sudoku-generator")
 
 PORT = 8080
+
+# Expert puzzles can take 0.2-5 s to make, so we make puzzles in the
+# background and keep a few ready for each difficulty. "New Game" then just
+# takes one off the shelf instead of waiting for the generator.
+READY_PUZZLES = 5
+ready = {d: queue.Queue(maxsize=READY_PUZZLES) for d in generator.DIFFICULTY_CLUES}
+background = threading.Event()   # set once the background makers are running
+
+
+def keep_puzzles_ready(difficulty):
+    while True:
+        # put() waits while the queue is full, so this only works when needed.
+        ready[difficulty].put(generator.generate(difficulty))
+
+
+def start_background_makers():
+    for difficulty in ready:
+        threading.Thread(target=keep_puzzles_ready, args=(difficulty,), daemon=True).start()
+    background.set()
+
+
+def get_puzzle(difficulty):
+    if background.is_set():
+        # Wait for the background maker rather than racing it with a second
+        # puzzle; two at once would just slow each other down.
+        return ready[difficulty].get()
+    return generator.generate(difficulty)  # no background makers (e.g. in tests)
 
 # The only files the browser may load: web address -> (file, content type).
 # Anything else (server.py, supabase.env, ...) gets a 404.
@@ -43,7 +68,7 @@ class Handler(BaseHTTPRequestHandler):
             difficulty = parse_qs(url.query).get("difficulty", ["medium"])[0]
             if difficulty not in generator.DIFFICULTY_CLUES:
                 difficulty = "medium"
-            self.send(json.dumps(generator.generate(difficulty)).encode(), "application/json")
+            self.send(json.dumps(get_puzzle(difficulty)).encode(), "application/json")
 
         elif url.path in FILES:
             filename, content_type = FILES[url.path]
@@ -83,9 +108,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    start_background_makers()
     print(f"Sudoku running at http://localhost:{PORT}  (Ctrl+C to stop)")
-    # 127.0.0.1 = only this computer can connect. Use "" to allow other
-    # devices on your network (e.g. to test on your phone).
     # Threading: each browser connection gets its own thread, so one idle
     # connection (browsers open spare ones) can't block every other request.
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
