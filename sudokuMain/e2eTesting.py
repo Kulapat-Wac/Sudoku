@@ -38,7 +38,7 @@ import server  # noqa: E402  (Web/server.py - its Handler serves the real site)
 CLUES = server.generator.DIFFICULTY_CLUES
 EXTRA_CLUES = 2
 
-# The accounts the fake Supabase knows, from test_users.json (fake, not real logins).
+# The accounts the fake Supabase knows, from test_users.json 
 # Most tests use the first one; test_every_test_user_can_log_in uses them all.
 with open(os.path.join(HERE, "test_users.json")) as f:
     TEST_USERS = {user["email"]: user["password"] for user in json.load(f)}
