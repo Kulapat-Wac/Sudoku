@@ -200,8 +200,11 @@ def main():
 
     if args.file:
         # Check puzzles from a file or from piped input.
-        text = sys.stdin.read() if args.file == "-" else open(args.file).read()
-        puzzles = json.loads(text)
+        if args.file == "-":
+            puzzles = json.load(sys.stdin)
+        else:
+            with open(args.file) as f:
+                puzzles = json.load(f)
         if isinstance(puzzles, dict):
             puzzles = [puzzles]
         for i, data in enumerate(puzzles, 1):

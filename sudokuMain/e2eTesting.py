@@ -27,11 +27,11 @@ import time
 import unittest
 from http.server import ThreadingHTTPServer
 
-from playwright.sync_api import sync_playwright, expect
+from playwright.sync_api import expect, sync_playwright
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "Web"))
-import server  # noqa: E402  (Web/server.py - its Handler serves the real site)
+import server  # Web/server.py - its Handler serves the real site
 
 # Clues per difficulty, straight from the generator. A puzzle may have up to
 # 2 more if the generator couldn't remove more and keep one solution.
@@ -408,7 +408,7 @@ class TestNewGame(SudokuE2E):
         self.cell(r, c).fill("5")
         self.click("New Game")
         self.page.wait_for_timeout(500)
-        warning_on_page = self.page.get_by_text(re.compile("lose|progress|sure", re.I)).count() > 0
+        warning_on_page = self.page.get_by_text(re.compile("lose|progress|sure", re.IGNORECASE)).count() > 0
         self.assertTrue(self.dialogs or warning_on_page,
                         "no warning before the game in progress was replaced")
 
@@ -480,10 +480,9 @@ class TestAuthentication(SudokuE2E):
                 self.page.evaluate("() => localStorage.clear()")   # forget them before the next user
 
     def test_users_cannot_use_each_others_passwords(self):
-        first_email = list(TEST_USERS)[0]
         second_password = list(TEST_USERS.values())[1]
         self.open_login()
-        self.fill_login(first_email, second_password)
+        self.fill_login(TEST_EMAIL, second_password)   # user 1's email, user 2's password
         self.click("Log In")
         self.assert_message("Invalid login credentials", "error")
 

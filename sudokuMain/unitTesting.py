@@ -18,7 +18,7 @@ import os
 import sys
 import time
 import unittest
-from functools import lru_cache
+from functools import cache
 from itertools import combinations
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -66,7 +66,7 @@ EVERY_CASE = [(d, s) for d in DIFFICULTIES for s in SEEDS]
 
 
 # Puzzles are slow to make (expert ~1 s), so make each one once and reuse it.
-@lru_cache(maxsize=None)
+@cache
 def generated(difficulty, seed):
     return generator.generate(difficulty, seed=seed)
 
@@ -118,9 +118,9 @@ def rate_by_technique(puzzle):
 
     def naked_single():
         # A cell with only one possible number.
-        for cell in options:
-            if empty(cell) and len(options[cell]) == 1:
-                return cell, next(iter(options[cell]))
+        for cell, numbers in options.items():
+            if empty(cell) and len(numbers) == 1:
+                return cell, next(iter(numbers))
 
     def hidden_single():
         # A number that fits in only one cell of a row, column or box.
